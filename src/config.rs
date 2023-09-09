@@ -22,9 +22,9 @@ pub struct AppConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BackupConfig {
-    repo: String,
-    src: PathBuf,
-    interval: Interval,
+    pub repo: String,
+    pub src: PathBuf,
+    pub interval: Interval,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

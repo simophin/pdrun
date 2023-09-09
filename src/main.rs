@@ -1,11 +1,17 @@
+mod backup;
 mod config;
+mod process;
 mod runner;
 
-use std::{io::BufReader, path::PathBuf, process::ExitCode};
+use std::{
+    io::BufReader,
+    path::PathBuf,
+    process::{ExitCode, ExitStatus},
+};
 
 use anyhow::Context;
 use clap::Parser;
-use tokio::runtime::Runtime;
+use tokio::task::LocalSet;
 
 /// A CLI tool to run your podman container with backup and auto update
 #[derive(Parser)]
@@ -34,11 +40,36 @@ fn main() -> anyhow::Result<ExitCode> {
         .build()
         .expect("to build a runtime");
 
-    rt.block_on(run(&rt, config))
+    let status: u8 = LocalSet::new()
+        .block_on(&rt, run(config))?
+        .code()
+        .unwrap_or(1)
+        .try_into()
+        .unwrap_or(1);
+
+    Ok(ExitCode::from(status))
 }
 
-async fn run(rt: &Runtime, config: config::Config) -> anyhow::Result<ExitCode> {
-    let handle = runner::run_app(rt, config.app).context("Start running app")?;
+async fn run(config: config::Config) -> anyhow::Result<ExitStatus> {
+    // let mut child = runner::run_app(&config.app).context("Starting container")?;
+    // loop {
+    //     let mut status = select! {
+    //         _ = tokio::signal::ctrl_c() => {
+    //             log::info!("Ctrl-C received, stopping container");
+    //             child.kill().await?;
+    //             None
+    //         }
 
-    Ok(handle.await.context("Waiting for app to exit")??)
+    //         status = child.wait() => {
+    //             Some(status.context("Waiting for container status")?)
+    //         }
+
+    //     };
+
+    //     if status.is_none() {
+    //         status = child.wait().await.context("Waiting for container status")?;
+    //     }
+    // }
+
+    todo!()
 }
