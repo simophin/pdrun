@@ -1,0 +1,13 @@
+app:
+  image: ubuntu:latest
+  args: ["ls", "/"]
+
+backups:
+  - repo: b2://fanchao-mail-backup/
+    src: /serverData/mailserver
+    interval: hourly
+
+  - repo: b2://fanchao-mail-backup2/
+    src: /serverData/mailserver2
+    interval: weekly
+
