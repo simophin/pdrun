@@ -1,9 +1,13 @@
-use std::{io::Write, process::ExitStatus, sync::Arc};
+use std::{
+    io::{self, Write},
+    process::{ExitStatus, Stdio},
+    sync::Arc,
+};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
-    process::{Child, ChildStderr, ChildStdout},
+    process::{Child, ChildStderr, ChildStdout, Command},
     select,
     sync::mpsc,
     sync::watch,
@@ -11,16 +15,22 @@ use tokio::{
 };
 
 pub struct Process {
-    command_tx: mpsc::Sender<Command>,
-    exit_watcher: watch::Receiver<Option<anyhow::Result<ExitStatus>>>,
+    command_tx: mpsc::Sender<ChildCommand>,
+    exit_watcher: watch::Receiver<Option<io::Result<ExitStatus>>>,
 }
 
-enum Command {
+enum ChildCommand {
     Kill,
 }
 
 impl Process {
-    pub fn new(log_prefix: String, mut child: Child) -> anyhow::Result<Self> {
+    pub fn new(log_prefix: String, mut child: Command) -> anyhow::Result<Self> {
+        let mut child = child
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Start running child")?;
+
         let stdout = child
             .stdout
             .take()
@@ -50,15 +60,21 @@ impl Process {
     }
 
     async fn kill(&mut self) -> anyhow::Result<()> {
-        self.command_tx.send(Command::Kill).await?;
+        self.command_tx.send(ChildCommand::Kill).await?;
         Ok(())
     }
 
     async fn wait(&mut self) -> anyhow::Result<ExitStatus> {
-        if let Some(s) = self.exit_watcher.borrow().as_ref() {
-            return s.clone();
+        self.exit_watcher
+            .wait_for(|s| s.is_some())
+            .await
+            .context("Waiting for status")?;
+
+        match self.exit_watcher.borrow().as_ref() {
+            Some(Ok(status)) => Ok(status.clone()),
+            Some(Err(err)) => Err(anyhow!("Child process exited with error: {err:?}")),
+            None => panic!("Must have result"),
         }
-        todo!()
     }
 }
 
@@ -67,8 +83,8 @@ async fn monitor(
     log_prefix: String,
     stdout: ChildStdout,
     stderr: ChildStderr,
-    mut command_rx: mpsc::Receiver<Command>,
-    exit_sender: watch::Sender<Option<anyhow::Result<ExitStatus>>>,
+    mut command_rx: mpsc::Receiver<ChildCommand>,
+    exit_sender: watch::Sender<Option<io::Result<ExitStatus>>>,
 ) {
     spawn_local(redirect_output(
         log_prefix.clone(),
@@ -95,16 +111,14 @@ async fn monitor(
         }
     };
 
-    let _ = exit_sender.send_replace(Some(
-        status.context("Waiting for child process exit status"),
-    ));
+    let _ = exit_sender.send_replace(Some(status));
 }
 
 async fn redirect_output(log_prefix: String, from: impl AsyncRead + Unpin, mut to: impl Write) {
     let mut from = BufReader::new(from);
     let mut line = String::default();
     while from.read_line(&mut line).await.is_ok() {
-        let _ = writeln!(to, "{log_prefix}{line}");
+        let _ = writeln!(to, "[{log_prefix}] {line}");
         line.clear();
     }
 }
