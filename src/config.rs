@@ -7,7 +7,7 @@ use strum::{Display, EnumString};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
-    pub backups: Option<Vec<BackupConfig>>,
+    pub backup: Option<BackupConfig>,
     pub app: AppConfig,
     pub update: Option<UpdateConfig>,
 }

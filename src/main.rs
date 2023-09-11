@@ -5,21 +5,24 @@ mod process;
 mod runner;
 
 use std::{
+    future::pending,
     io::BufReader,
     path::PathBuf,
     process::{ExitCode, ExitStatus},
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context};
 use async_shutdown::Shutdown;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use config::{AppConfig, BackupConfig, UpdateConfig};
-use futures::future::join_all;
+use futures::never;
 use tokio::{
     select,
     signal::ctrl_c,
     task::{spawn_local, LocalSet},
+    time::{sleep, sleep_until},
 };
 
 use crate::process::Process;
@@ -65,44 +68,23 @@ fn main() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(status))
 }
 
-async fn restore(backups: &Vec<BackupConfig>, shutdown: Shutdown) -> anyhow::Result<()> {
-    if backups.is_empty() {
-        log::info!(target: "supervisor", "No backup config found, skipping restoring.");
+async fn restore(backup: &BackupConfig, shutdown: Shutdown) -> anyhow::Result<()> {
+    if backup.src.exists() {
+        log::info!(
+            target: "supervisor",
+            "Backup directory {} exists, skipping restore",
+            backup.src.display()
+        );
+        return Ok(());
     }
 
-    // Restore backup if the backup directory is
-    let mut restore_handles = vec![];
-    for (i, backup) in backups.iter().enumerate() {
-        if backup.src.exists() {
-            log::info!(
-                target: "supervisor",
-                "Backup directory {} exists, skipping restore",
-                backup.src.display()
-            );
-            continue;
-        }
-
-        let mut process = Process::new(
-            format!("restore_{i}"),
-            backup::restore(backup),
-            shutdown.clone(),
-        )
+    let mut process = Process::new("restore", backup::restore(backup), shutdown)
         .context("Starting restoring process")?;
 
-        restore_handles.push(spawn_local(
-            async move { process.terminate_and_wait().await },
-        ));
-    }
-
-    for status in join_all(restore_handles).await {
-        if !status
-            .context("Waiting for status")?
-            .context("Restoring process")?
-            .success()
-        {
-            bail!("Restoring process failed");
-        }
-    }
+    process
+        .wait()
+        .await
+        .context("Waiting for restoring process")?;
 
     Ok(())
 }
@@ -134,7 +116,30 @@ async fn init_pull_image(
         }
     };
 
-    Ok((now + update.interval).signed_duration_since(now))
+    Ok((now + update.interval)
+        .signed_duration_since(now)
+        .to_std()
+        .unwrap())
+}
+
+fn next_backup_time(backup: &BackupConfig, last_backup: Option<DateTime<Utc>>) -> Duration {
+    let now = Utc::now();
+
+    match last_backup {
+        Some(last) if last + backup.interval < now => {
+            (last + backup.interval).signed_duration_since(now)
+        }
+        _ => (now + backup.interval).signed_duration_since(now),
+    }
+    .to_std()
+    .unwrap()
+}
+
+async fn sleep_until_or_forever(until: Option<Instant>) {
+    match until {
+        Some(until) => sleep_until(until.into()).await,
+        None => pending().await,
+    }
 }
 
 async fn monitor_ctrl_c(shutdown: Shutdown) {
@@ -145,23 +150,37 @@ async fn monitor_ctrl_c(shutdown: Shutdown) {
 
 async fn run(config: config::Config, shutdown: Shutdown) -> anyhow::Result<ExitStatus> {
     let config::Config {
-        backups,
+        backup,
         app,
         update,
     } = config;
-    let backups = backups.unwrap_or_default();
     let update = update.unwrap_or_default();
 
-    restore(&backups, shutdown.clone()).await?;
+    if let Some(backup) = &backup {
+        restore(backup, shutdown.clone()).await?;
+    }
 
-    let mut next_update = init_pull_image(&app, &update, shutdown.clone()).await?;
-    log::info!(target: "supervisor", "Next image update time is: {next_update}");
+    let mut next_update = Instant::now() + init_pull_image(&app, &update, shutdown.clone()).await?;
+    log::info!(target: "supervisor", "Next image update time is: {next_update:?}");
 
     let mut process =
         Process::new("app", runner::run_app(&app), shutdown).context("Starting app process")?;
 
+    let mut last_backup = None;
+    let mut next_backup = backup
+        .as_ref()
+        .map(|c| Instant::now() + next_backup_time(c, last_backup));
+
     loop {
-        select! {}
+        select! {
+            _ = sleep_until_or_forever(next_backup) => {
+                log::info!(target: "supervisor", "Started backup");
+            }
+
+            _ = sleep_until(next_update.into()) => {
+                log::info!(target: "supervisor", "Started updating");
+            }
+        }
     }
 
     process.wait().await.context("Waiting for app process")
