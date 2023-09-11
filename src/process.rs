@@ -1,33 +1,42 @@
 use std::{
-    io::{self, Write},
     process::{ExitStatus, Stdio},
-    sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context};
+use async_shutdown::Shutdown;
+use nix::{
+    sys::signal::{kill, Signal::SIGTERM},
+    unistd::Pid,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
-    process::{Child, ChildStderr, ChildStdout, Command},
-    select,
-    sync::mpsc,
+    process::{Child, Command},
     sync::watch,
     task::spawn_local,
+    time::timeout,
 };
 
 pub struct Process {
-    command_tx: mpsc::Sender<ChildCommand>,
-    exit_watcher: watch::Receiver<Option<io::Result<ExitStatus>>>,
-}
-
-enum ChildCommand {
-    Kill,
+    shutdown: Shutdown,
+    exit_watcher: watch::Receiver<Option<anyhow::Result<ExitStatus>>>,
 }
 
 impl Process {
-    pub fn new(log_prefix: String, mut child: Command) -> anyhow::Result<Self> {
+    pub fn new(
+        log_prefix: impl AsRef<str>,
+        mut child: Command,
+        shutdown: Shutdown,
+    ) -> anyhow::Result<Self> {
+        log::info!(
+            target: "supervisor",
+            "Starting child process: {}", log_prefix.as_ref()
+        );
+
         let mut child = child
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .context("Start running child")?;
 
@@ -41,30 +50,50 @@ impl Process {
             .take()
             .context("Expecting stderr from child process")?;
 
-        let (command_tx, command_rx) = mpsc::channel(1);
+        let child_pid = Pid::from_raw(child.id().context("To have a PID")? as i32);
+
+        let log_prefix = format!(
+            "{log_prefix}({child_pid})",
+            log_prefix = log_prefix.as_ref(),
+            child_pid = child_pid.as_raw()
+        );
+
         let (exit_sender, exit_watcher) = watch::channel(None);
 
-        spawn_local(monitor(
-            child,
-            log_prefix,
-            stdout,
-            stderr,
-            command_rx,
-            exit_sender,
-        ));
+        spawn_local(redirect_output(log_prefix.clone(), stdout));
+        spawn_local(redirect_output(log_prefix.clone(), stderr));
+
+        {
+            let shutdown = shutdown.clone();
+            spawn_local(async move {
+                let status =
+                    monitor_exit_status(child, child_pid, log_prefix.clone(), shutdown).await;
+
+                match &status {
+                    Ok(status) if status.success() => {
+                        log::info!(target: "supervisor", "Child process {log_prefix} exited successfully");
+                    }
+
+                    Ok(status) => {
+                        log::info!(target: "supervisor", "Child process {log_prefix} exited with status {status}");
+                    }
+
+                    Err(err) => {
+                        log::error!(target: "supervisor", "Getting exit code for process {log_prefix} encountered error: {err:?}");
+                    }
+                }
+
+                let _ = exit_sender.send_replace(Some(status));
+            })
+        };
 
         Ok(Self {
-            command_tx,
+            shutdown,
             exit_watcher,
         })
     }
 
-    async fn kill(&mut self) -> anyhow::Result<()> {
-        self.command_tx.send(ChildCommand::Kill).await?;
-        Ok(())
-    }
-
-    async fn wait(&mut self) -> anyhow::Result<ExitStatus> {
+    pub async fn wait(&mut self) -> anyhow::Result<ExitStatus> {
         self.exit_watcher
             .wait_for(|s| s.is_some())
             .await
@@ -76,49 +105,50 @@ impl Process {
             None => panic!("Must have result"),
         }
     }
+
+    pub async fn terminate_and_wait(&mut self) -> anyhow::Result<ExitStatus> {
+        self.shutdown.shutdown();
+        self.wait().await
+    }
 }
 
-async fn monitor(
+async fn monitor_exit_status(
     mut child: Child,
+    child_pid: Pid,
     log_prefix: String,
-    stdout: ChildStdout,
-    stderr: ChildStderr,
-    mut command_rx: mpsc::Receiver<ChildCommand>,
-    exit_sender: watch::Sender<Option<io::Result<ExitStatus>>>,
-) {
-    spawn_local(redirect_output(
-        log_prefix.clone(),
-        stdout,
-        std::io::stdout(),
-    ));
-
-    spawn_local(redirect_output(
-        log_prefix.clone(),
-        stderr,
-        std::io::stderr(),
-    ));
-
-    let status = select! {
-        _ = command_rx.recv() => {
-            println!("[supervisor] Receive kill command, terminating child process");
-            let _ = child.kill().await;
-            child.wait().await
+    shutdown: Shutdown,
+) -> anyhow::Result<ExitStatus> {
+    match shutdown.wrap_cancel(child.wait()).await {
+        Some(status) => return status.context("Getting exit status"),
+        None => {
+            log::info!(target: "supervisor", "Terminating child process {log_prefix}");
+            kill(child_pid, SIGTERM).with_context(|| format!("Sending SIGTERM to {log_prefix}"))?;
         }
+    }
 
-        status = child.wait() => {
-            println!("[supervisor] Child process exited with {status:?}");
-            status
+    match timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(status) => return status.context("Getting exit status"),
+        Err(_) => {
+            log::info!(
+                target: "supervisor", "Child process {log_prefix} did not terminate in 5 seconds, killing it",
+            );
+
+            child.start_kill().context("Start killing child process")?;
+            child
+                .wait()
+                .await
+                .with_context(|| format!("Waiting for {log_prefix} to exit"))
         }
-    };
-
-    let _ = exit_sender.send_replace(Some(status));
+    }
 }
 
-async fn redirect_output(log_prefix: String, from: impl AsyncRead + Unpin, mut to: impl Write) {
+async fn redirect_output(log_prefix: String, from: impl AsyncRead + Unpin) -> anyhow::Result<()> {
     let mut from = BufReader::new(from);
     let mut line = String::default();
-    while from.read_line(&mut line).await.is_ok() {
-        let _ = writeln!(to, "[{log_prefix}] {line}");
+    while from.read_line(&mut line).await.context("Read line")? > 0 {
+        log::info!(target: &log_prefix, "{}", line.trim_end());
         line.clear();
     }
+
+    Ok(())
 }

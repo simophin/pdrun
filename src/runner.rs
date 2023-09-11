@@ -1,12 +1,15 @@
-use std::process::Stdio;
-
-use anyhow::Context;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
 use super::config::AppConfig;
 
-pub fn run_app(config: &AppConfig) -> anyhow::Result<Child> {
-    let mut cmd = Command::new("docker");
+pub fn pull_image(config: &AppConfig) -> Command {
+    let mut cmd = Command::new("podman");
+    cmd.arg("pull").arg(&config.image);
+    cmd
+}
+
+pub fn run_app(config: &AppConfig) -> Command {
+    let mut cmd = Command::new("podman");
 
     cmd.arg("run");
 
@@ -16,6 +19,8 @@ pub fn run_app(config: &AppConfig) -> anyhow::Result<Child> {
         volumes,
         cap_add,
         environments,
+        ports,
+        network_mode,
     } = config;
 
     if let Some(envs) = &environments {
@@ -36,19 +41,22 @@ pub fn run_app(config: &AppConfig) -> anyhow::Result<Child> {
         }
     }
 
-    cmd.args(["--network", "host", "-it", "--rm"]);
+    if let Some(ports) = ports {
+        for port in ports {
+            cmd.arg("-p").arg(port);
+        }
+    }
+
+    if let Some(network_mode) = network_mode {
+        cmd.arg("--network").arg(network_mode.to_string());
+    }
+
+    cmd.args(["--rm", "--init"]);
     cmd.arg(image);
 
     if let Some(args) = args {
         cmd.args(args);
     }
 
-    let child = cmd
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .context("Starting container")?;
-
-    Ok(child)
+    cmd
 }
