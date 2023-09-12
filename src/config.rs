@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ops::Add, path::PathBuf};
+use std::{collections::HashMap, ops::Add, path::PathBuf, time::Duration};
 
 use chrono::{DateTime, Days, Months, Utc};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,7 @@ pub struct BackupConfig {
     pub repo: String,
     pub src: PathBuf,
     pub interval: Interval,
+    pub strategy: Option<BackupStrategy>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -40,6 +41,21 @@ impl Default for UpdateConfig {
         Self {
             interval: Interval::Daily,
         }
+    }
+}
+
+#[derive(
+    Display, EnumString, Debug, Clone, SerializeDisplay, DeserializeFromStr, Copy, PartialEq, Eq,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum BackupStrategy {
+    StopApp,
+    Live,
+}
+
+impl Default for BackupStrategy {
+    fn default() -> Self {
+        Self::StopApp
     }
 }
 
@@ -62,6 +78,12 @@ impl Add<Interval> for DateTime<Utc> {
             Interval::Weekly => self.checked_add_days(Days::new(7)).unwrap(),
             Interval::Monthly => self.checked_add_months(Months::new(1)).unwrap(),
         }
+    }
+}
+
+impl Interval {
+    pub fn to_duration(&self, now: DateTime<Utc>) -> Duration {
+        (now + *self).signed_duration_since(now).to_std().unwrap()
     }
 }
 

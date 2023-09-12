@@ -17,6 +17,8 @@ use tokio::{
     time::timeout,
 };
 
+use crate::log::{elogPrint, logPrint};
+
 pub struct Process {
     shutdown: Shutdown,
     exit_watcher: watch::Receiver<Option<anyhow::Result<ExitStatus>>>,
@@ -28,9 +30,10 @@ impl Process {
         mut child: Command,
         shutdown: Shutdown,
     ) -> anyhow::Result<Self> {
-        log::info!(
-            target: "supervisor",
-            "Starting child process: {}", log_prefix.as_ref()
+        logPrint!(
+            "supervisor",
+            "Starting child process: {}",
+            log_prefix.as_ref()
         );
 
         let mut child = child
@@ -61,7 +64,7 @@ impl Process {
         let (exit_sender, exit_watcher) = watch::channel(None);
 
         spawn_local(redirect_output(log_prefix.clone(), stdout));
-        spawn_local(redirect_output(log_prefix.clone(), stderr));
+        spawn_local(redirect_error(log_prefix.clone(), stderr));
 
         {
             let shutdown = shutdown.clone();
@@ -71,15 +74,24 @@ impl Process {
 
                 match &status {
                     Ok(status) if status.success() => {
-                        log::info!(target: "supervisor", "Child process {log_prefix} exited successfully");
+                        logPrint!(
+                            "supervisor",
+                            "Child process {log_prefix} exited successfully"
+                        );
                     }
 
                     Ok(status) => {
-                        log::info!(target: "supervisor", "Child process {log_prefix} exited with status {status}");
+                        logPrint!(
+                            "supervisor",
+                            "Child process {log_prefix} exited with status {status}"
+                        );
                     }
 
                     Err(err) => {
-                        log::error!(target: "supervisor", "Getting exit code for process {log_prefix} encountered error: {err:?}");
+                        elogPrint!(
+                            "supervisor",
+                            "Getting exit code for process {log_prefix} encountered error: {err:?}"
+                        );
                     }
                 }
 
@@ -121,7 +133,7 @@ async fn monitor_exit_status(
     match shutdown.wrap_cancel(child.wait()).await {
         Some(status) => return status.context("Getting exit status"),
         None => {
-            log::info!(target: "supervisor", "Terminating child process {log_prefix}");
+            logPrint!("supervisor", "Terminating child process {log_prefix}");
             kill(child_pid, SIGTERM).with_context(|| format!("Sending SIGTERM to {log_prefix}"))?;
         }
     }
@@ -129,8 +141,9 @@ async fn monitor_exit_status(
     match timeout(Duration::from_secs(5), child.wait()).await {
         Ok(status) => return status.context("Getting exit status"),
         Err(_) => {
-            log::info!(
-                target: "supervisor", "Child process {log_prefix} did not terminate in 5 seconds, killing it",
+            logPrint!(
+                "supervisor",
+                "Child process {log_prefix} did not terminate in 5 seconds, killing it"
             );
 
             child.start_kill().context("Start killing child process")?;
@@ -146,7 +159,18 @@ async fn redirect_output(log_prefix: String, from: impl AsyncRead + Unpin) -> an
     let mut from = BufReader::new(from);
     let mut line = String::default();
     while from.read_line(&mut line).await.context("Read line")? > 0 {
-        log::info!(target: &log_prefix, "{}", line.trim_end());
+        logPrint!(&log_prefix, "{}", line.trim_end());
+        line.clear();
+    }
+
+    Ok(())
+}
+
+async fn redirect_error(log_prefix: String, from: impl AsyncRead + Unpin) -> anyhow::Result<()> {
+    let mut from = BufReader::new(from);
+    let mut line = String::default();
+    while from.read_line(&mut line).await.context("Read line")? > 0 {
+        elogPrint!(&log_prefix, "{}", line.trim_end());
         line.clear();
     }
 
