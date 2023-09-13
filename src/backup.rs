@@ -1,24 +1,19 @@
 use tokio::process::Command;
 
-use crate::config::BackupConfig;
+use crate::{config::BackupConfig, restic::build_restic_command};
 
 pub fn restore(backup: &BackupConfig) -> Command {
-    let mut cmd = Command::new("restic");
-
-    cmd.arg("-r")
-        .arg(&backup.repo)
-        .args(["--verbose", "restore", "latest"]);
+    let mut cmd = build_restic_command(backup);
+    cmd.args(["--verbose", "restore", "latest"])
+        .arg("--target")
+        .arg(&backup.src);
 
     cmd
 }
 
 pub fn backup(backup: &BackupConfig) -> Command {
-    let mut cmd = Command::new("restic");
+    let mut cmd = build_restic_command(backup);
 
-    cmd.arg("-r")
-        .arg(&backup.repo)
-        .args(["--verbose", "backup"])
-        .arg(&backup.src);
-
+    cmd.args(["--verbose", "backup"]).arg(&backup.src);
     cmd
 }

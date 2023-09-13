@@ -12,17 +12,28 @@ struct Snapshot {
     time: DateTime<Utc>,
 }
 
+pub fn build_restic_command(config: &BackupConfig) -> Command {
+    let mut cmd = Command::new("restic");
+
+    if let Some(env) = &config.environments {
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }
+
+    cmd.arg("-r").arg(&config.repo);
+    cmd
+}
+
 pub async fn get_latest_snapshot_time(
     config: &BackupConfig,
 ) -> anyhow::Result<Option<DateTime<Utc>>> {
-    let mut cmd = Command::new("restic");
+    let mut cmd = build_restic_command(config);
 
     let snapshots: Vec<Snapshot> = serde_json::from_slice(
         &cmd.args(["snapshots", "--json", "--latest", "1"])
             .arg("--path")
             .arg(&config.src)
-            .arg("-r")
-            .arg(&config.repo)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)

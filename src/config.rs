@@ -1,6 +1,7 @@
-use std::{collections::HashMap, ops::Add, path::PathBuf, time::Duration};
+use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr, time::Duration};
 
-use chrono::{DateTime, Days, Months, Utc};
+use chrono::{DateTime, Days, TimeZone};
+use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use strum::{Display, EnumString};
@@ -29,6 +30,7 @@ pub struct BackupConfig {
     pub src: PathBuf,
     pub interval: Interval,
     pub strategy: Option<BackupStrategy>,
+    pub environments: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -59,31 +61,56 @@ impl Default for BackupStrategy {
     }
 }
 
-#[derive(Display, EnumString, Debug, Clone, SerializeDisplay, DeserializeFromStr, Copy)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, SerializeDisplay, DeserializeFromStr)]
 pub enum Interval {
     Hourly,
     Daily,
     Weekly,
-    Monthly,
+    Custom(Schedule),
 }
 
-impl Add<Interval> for DateTime<Utc> {
-    type Output = Self;
+impl FromStr for Interval {
+    type Err = cron::error::Error;
 
-    fn add(self, rhs: Interval) -> Self::Output {
-        match rhs {
-            Interval::Hourly => self.add(chrono::Duration::hours(1)),
-            Interval::Daily => self.checked_add_days(Days::new(1)).unwrap(),
-            Interval::Weekly => self.checked_add_days(Days::new(7)).unwrap(),
-            Interval::Monthly => self.checked_add_months(Months::new(1)).unwrap(),
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "hourly" => Ok(Self::Hourly),
+            "daily" => Ok(Self::Daily),
+            "weekly" => Ok(Self::Weekly),
+            s => Ok(Self::Custom(s.parse()?)),
+        }
+    }
+}
+
+impl Display for Interval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Interval::Hourly => f.write_str("hourly"),
+            Interval::Daily => f.write_str("daily"),
+            Interval::Weekly => f.write_str("weekly"),
+            Interval::Custom(s) => Display::fmt(s, f),
         }
     }
 }
 
 impl Interval {
-    pub fn to_duration(&self, now: DateTime<Utc>) -> Duration {
-        (now + *self).signed_duration_since(now).to_std().unwrap()
+    pub fn next<Tz>(&self, last: Option<DateTime<Tz>>, now: DateTime<Tz>) -> Option<Duration>
+    where
+        Tz: TimeZone,
+        <Tz as TimeZone>::Offset: Copy,
+    {
+        let next = match self {
+            Interval::Hourly => Some(last.unwrap_or_else(|| now) + chrono::Duration::hours(1)),
+            Interval::Daily => last.unwrap_or_else(|| now).checked_add_days(Days::new(1)),
+            Interval::Weekly => last.unwrap_or_else(|| now).checked_add_days(Days::new(7)),
+            Interval::Custom(s) => s.after_owned(now).next(),
+        };
+
+        match next {
+            Some(next) if next >= now => (next - now).to_std().ok(),
+            Some(_) => Some(Duration::ZERO),
+            None => None,
+        }
     }
 }
 

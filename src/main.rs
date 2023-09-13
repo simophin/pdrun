@@ -6,27 +6,28 @@ mod log;
 mod process;
 mod restic;
 mod runner;
+mod tz;
 
 use std::{
     future::pending,
     io::BufReader,
     path::PathBuf,
     process::{ExitCode, ExitStatus},
-    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context};
 use async_shutdown::Shutdown;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clap::Parser;
-use config::{AppConfig, BackupConfig, UpdateConfig};
+use config::{AppConfig, BackupConfig};
 use runner::pull_image;
 use tokio::{
     select,
     signal::ctrl_c,
     task::{spawn_local, LocalSet},
-    time::sleep_until,
+    time::{sleep_until, Instant},
 };
+use tz::current_timezone;
 
 use crate::process::Process;
 use log::logPrint;
@@ -61,7 +62,7 @@ fn main() -> anyhow::Result<ExitCode> {
         .block_on(&rt, async move {
             let shutdown = Shutdown::new();
             spawn_local(monitor_ctrl_c(shutdown.clone()));
-            run(config, shutdown).await
+            run(config, shutdown.clone()).await
         })?
         .code()
         .unwrap_or(1)
@@ -71,7 +72,7 @@ fn main() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(status))
 }
 
-async fn restore(backup: &BackupConfig, shutdown: Shutdown) -> anyhow::Result<()> {
+async fn restore_if_needed(backup: &BackupConfig, shutdown: Shutdown) -> anyhow::Result<()> {
     if backup.src.exists() {
         logPrint!(
             "supervisor",
@@ -90,52 +91,6 @@ async fn restore(backup: &BackupConfig, shutdown: Shutdown) -> anyhow::Result<()
         .context("Waiting for restoring process")?;
 
     Ok(())
-}
-
-async fn init_pull_image(
-    app: &AppConfig,
-    update: &UpdateConfig,
-    shutdown: Shutdown,
-) -> anyhow::Result<Duration> {
-    // Read last image creation time
-    let image_creation_time = image_info::image_creation_time(&app.image).await.ok();
-    let now = Utc::now();
-
-    match image_creation_time {
-        Some(last) if last + update.interval < now => {
-            logPrint!("supervisor", "Skipped updating image");
-        }
-
-        _ => {
-            logPrint!("supervisor", "Updating image");
-            let mut process = Process::new("pull_image", runner::pull_image(&app), shutdown)
-                .context("Starting update process")?;
-
-            process.wait().await.context("Waiting for update process")?;
-
-            image_info::image_creation_time(&app.image)
-                .await
-                .context("Reading image creation time")?;
-        }
-    };
-
-    Ok((now + update.interval)
-        .signed_duration_since(now)
-        .to_std()
-        .unwrap())
-}
-
-fn next_backup_time(backup: &BackupConfig, last_backup: Option<DateTime<Utc>>) -> Duration {
-    let now = Utc::now();
-
-    match last_backup {
-        Some(last) if last + backup.interval < now => {
-            (last + backup.interval).signed_duration_since(now)
-        }
-        _ => (now + backup.interval).signed_duration_since(now),
-    }
-    .to_std()
-    .unwrap()
 }
 
 async fn sleep_until_or_forever(until: Option<Instant>) {
@@ -163,8 +118,6 @@ async fn start_backup(
         logPrint!("supervisor", "Stopping app before starting backup");
         let _ = app_process.terminate_and_wait().await;
     }
-
-    logPrint!("supervisor", "Starting backup process");
 
     let mut process = Process::new("backup", backup::backup(backup), shutdown.clone())
         .context("Starting backup process")?;
@@ -231,44 +184,56 @@ async fn run(config: config::Config, shutdown: Shutdown) -> anyhow::Result<ExitS
     let update = update.unwrap_or_default();
 
     if let Some(backup) = &backup {
-        restore(backup, shutdown.clone()).await?;
+        restore_if_needed(backup, shutdown.clone()).await?;
+        if shutdown.shutdown_started() {
+            bail!("Shutting down while restoring backup")
+        }
     }
 
-    let mut next_update = Instant::now() + init_pull_image(&app, &update, shutdown.clone()).await?;
-    logPrint!("supervisor", "Next image update time is: {next_update:?}");
+    let tz = current_timezone();
+
+    let mut last_update = None;
 
     let mut process = Process::new("app", runner::run_app(&app), shutdown.clone())
         .context("Starting app process")?;
 
     let mut last_backup;
-    let mut next_backup;
 
     if let Some(backup) = &backup {
         last_backup = restic::get_latest_snapshot_time(backup)
             .await
-            .context("Getting latest backup time")?;
-        next_backup = Some(Instant::now() + next_backup_time(backup, last_backup));
+            .context("Getting latest backup time")?
+            .map(|s| s.with_timezone(&tz));
     } else {
         last_backup = None;
-        next_backup = None;
     }
 
-    loop {
+    while !shutdown.shutdown_started() {
+        let now = Utc::now().with_timezone(&tz);
+
+        let next_backup = backup
+            .as_ref()
+            .and_then(|b| b.interval.next(last_backup, now))
+            .map(|d| {
+                logPrint!("supervisor", "Next backup time is in {d:?}");
+                Instant::now() + d
+            });
+
+        let next_update = update.interval.next(last_update, now).map(|d| {
+            logPrint!("supervisor", "Next update time is in {d:?}");
+            Instant::now() + d
+        });
+
         select! {
             _ = sleep_until_or_forever(next_backup) => {
                 let backup = backup.as_ref().unwrap();
                 process = start_backup(backup, &app, shutdown.clone(), process).await.context("Running backup process")?;
-                last_backup = Some(Utc::now());
-                let duration = next_backup_time(backup, last_backup);
-                logPrint!("supervisor", "Next backup time is in {duration:?}");
-                next_backup = Some(Instant::now() + duration);
+                last_backup = Some(Utc::now().with_timezone(&tz));
             }
 
-            _ = sleep_until(next_update.into()) => {
+            _ = sleep_until_or_forever(next_update) => {
                 process = start_update(&app, process, shutdown.clone()).await.context("Running update process")?;
-                let duration = update.interval.to_duration(Utc::now());
-                logPrint!("supervisor", "Next image update time is in {duration:?}");
-                next_update = Instant::now() + duration;
+                last_update = Some(Utc::now().with_timezone(&tz));
             }
 
             status = process.wait() => {
@@ -276,4 +241,6 @@ async fn run(config: config::Config, shutdown: Shutdown) -> anyhow::Result<ExitS
             }
         }
     }
+
+    bail!("Shutting down")
 }

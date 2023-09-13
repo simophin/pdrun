@@ -66,11 +66,19 @@ impl Process {
         spawn_local(redirect_output(log_prefix.clone(), stdout));
         spawn_local(redirect_error(log_prefix.clone(), stderr));
 
+        let internal_shutdown = Shutdown::new();
+
         {
-            let shutdown = shutdown.clone();
+            let internal_shutdown = internal_shutdown.clone();
             spawn_local(async move {
-                let status =
-                    monitor_exit_status(child, child_pid, log_prefix.clone(), shutdown).await;
+                let status = monitor_exit_status(
+                    child,
+                    child_pid,
+                    log_prefix.clone(),
+                    shutdown,
+                    internal_shutdown,
+                )
+                .await;
 
                 match &status {
                     Ok(status) if status.success() => {
@@ -100,7 +108,7 @@ impl Process {
         };
 
         Ok(Self {
-            shutdown,
+            shutdown: internal_shutdown,
             exit_watcher,
         })
     }
@@ -129,10 +137,14 @@ async fn monitor_exit_status(
     child_pid: Pid,
     log_prefix: String,
     shutdown: Shutdown,
+    internal_shutdown: Shutdown,
 ) -> anyhow::Result<ExitStatus> {
-    match shutdown.wrap_cancel(child.wait()).await {
-        Some(status) => return status.context("Getting exit status"),
-        None => {
+    match internal_shutdown
+        .wrap_cancel(shutdown.wrap_cancel(child.wait()))
+        .await
+    {
+        Some(Some(status)) => return status.context("Getting exit status"),
+        _ => {
             logPrint!("supervisor", "Terminating child process {log_prefix}");
             kill(child_pid, SIGTERM).with_context(|| format!("Sending SIGTERM to {log_prefix}"))?;
         }
