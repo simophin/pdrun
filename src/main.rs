@@ -5,6 +5,7 @@ mod image_info;
 mod log;
 mod process;
 mod restic;
+mod restores;
 mod runner;
 mod tz;
 
@@ -19,7 +20,8 @@ use anyhow::{bail, Context};
 use async_shutdown::Shutdown;
 use chrono::Utc;
 use clap::Parser;
-use config::{AppConfig, BackupConfig};
+use config::{AppConfig, BackupConfig, RestoreConfig};
+use restores::restore;
 use runner::pull_image;
 use tokio::{
     select,
@@ -72,18 +74,18 @@ fn main() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(status))
 }
 
-async fn restore_if_needed(backup: &BackupConfig, shutdown: Shutdown) -> anyhow::Result<()> {
-    if backup.src.exists() {
+async fn restore_if_needed(backup: &RestoreConfig, shutdown: Shutdown) -> anyhow::Result<()> {
+    if backup.dst.exists() && backup.strategy != Some(config::RestoreStrategy::Always) {
         logPrint!(
             "supervisor",
-            "Backup directory {} exists, skipping restore",
-            backup.src.display()
+            "Directory {} exists, skipping restore",
+            backup.dst.display()
         );
         return Ok(());
     }
 
-    let mut process = Process::new("restore", backup::restore(backup), shutdown)
-        .context("Starting restoring process")?;
+    let mut process =
+        Process::new("restore", restore(backup), shutdown).context("Starting restoring process")?;
 
     process
         .wait()
@@ -159,7 +161,7 @@ async fn start_update(
         .await
         .context("Getting image creation time")?;
 
-    if new_time != old_time {
+    if new_time.is_some() && new_time != old_time {
         logPrint!("supervisor", "Image updated, restarting app");
         app_process
             .terminate_and_wait()
@@ -180,11 +182,12 @@ async fn run(config: config::Config, shutdown: Shutdown) -> anyhow::Result<ExitS
         backup,
         app,
         update,
+        restore,
     } = config;
     let update = update.unwrap_or_default();
 
-    if let Some(backup) = &backup {
-        restore_if_needed(backup, shutdown.clone()).await?;
+    if let Some(restore) = &restore {
+        restore_if_needed(restore, shutdown.clone()).await?;
         if shutdown.shutdown_started() {
             bail!("Shutting down while restoring backup")
         }
@@ -193,20 +196,16 @@ async fn run(config: config::Config, shutdown: Shutdown) -> anyhow::Result<ExitS
     let tz = current_timezone();
 
     let mut last_update = None;
-
-    let mut process = Process::new("app", runner::run_app(&app), shutdown.clone())
-        .context("Starting app process")?;
-
-    let mut last_backup;
+    let mut last_backup = None;
 
     if let Some(backup) = &backup {
         last_backup = restic::get_latest_snapshot_time(backup)
             .await
-            .context("Getting latest backup time")?
             .map(|s| s.with_timezone(&tz));
-    } else {
-        last_backup = None;
     }
+
+    let mut process = Process::new("app", runner::run_app(&app), shutdown.clone())
+        .context("Starting app process")?;
 
     while !shutdown.shutdown_started() {
         let now = Utc::now().with_timezone(&tz);

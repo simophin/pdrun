@@ -9,8 +9,17 @@ use strum::{Display, EnumString};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub backup: Option<BackupConfig>,
+    pub restore: Option<RestoreConfig>,
     pub app: AppConfig,
     pub update: Option<UpdateConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RestoreConfig {
+    pub repo: String,
+    pub dst: PathBuf,
+    pub strategy: Option<RestoreStrategy>,
+    pub environments: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -58,6 +67,21 @@ pub enum BackupStrategy {
 impl Default for BackupStrategy {
     fn default() -> Self {
         Self::StopApp
+    }
+}
+
+#[derive(
+    Display, EnumString, Debug, Clone, SerializeDisplay, DeserializeFromStr, Copy, PartialEq, Eq,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum RestoreStrategy {
+    EmptyDstOnly,
+    Always,
+}
+
+impl Default for RestoreStrategy {
+    fn default() -> Self {
+        Self::EmptyDstOnly
     }
 }
 
